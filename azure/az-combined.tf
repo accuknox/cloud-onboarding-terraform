@@ -1,4 +1,6 @@
 # Combined Terraform of main.tf, variables.tf, version.tf
+
+
 ########################################################
 # Terraform Dependencies
 ########################################################
@@ -28,6 +30,8 @@ provider "azurerm" {
 
 provider "azapi" {}
 
+
+
 ########################################################
 # Variables
 ########################################################
@@ -35,15 +39,13 @@ provider "azapi" {}
 variable "managing_tenant_id" {
   description = "AccuKnox tenant ID"
   type        = string
-  default     = ""
+  default     = "3d64034d-3c3e-4959-b019-f15558be8a4e"
 }
-
-
 
 variable "accuknox_verification_token" {
   description = "Unique verification token provided by AccuKnox (DO NOT MODIFY)"
   type        = string
-  default     = ""
+  default     = "AK-CNAPP-{{TOKEN}}"
 
   validation {
     condition     = can(regex("^AK-CNAPP-", var.accuknox_verification_token))
@@ -53,6 +55,7 @@ variable "accuknox_verification_token" {
 
 
 
+# User Provides
 variable "management_group_id" {
   description = "Root management group ID where the policy will be assigned"
   type        = string
@@ -120,6 +123,16 @@ variable "mode" {
   }
 }
 
+
+# Global exclusions (applies to both modes)
+variable "excluded_subscription_ids" {
+  description = "Subscriptions to exclude globally"
+  type        = list(string)
+  default     = []
+}
+
+
+# Include mode variables (use when mode = "include")
 variable "included_management_group_ids" {
   description = "Management groups to include (include mode only)"
   type        = list(string)
@@ -133,14 +146,7 @@ variable "include_extra_subscription_ids" {
 }
 
 
-variable "excluded_subscription_ids" {
-  description = "Subscriptions to exclude globally"
-  type        = list(string)
-  default     = []
-}
-
-
-
+# Exclude mode variables (use when mode = "exclude")
 variable "excluded_management_groups" {
   description = "Management groups to exclude (exclude mode only)"
   type        = list(string)
