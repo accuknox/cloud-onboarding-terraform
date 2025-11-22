@@ -73,3 +73,6 @@ Thumbs.db
 
 # Claude configuration
 .claude/
+
+cmds.md
+local-scripts/

@@ -43,7 +43,7 @@ locals {
 data "external" "included_mg_subs" {
   for_each = var.mode == "include" ? toset(var.included_management_group_ids) : []
   program  = ["bash", "-c", <<-EOT
-    az graph query -q "ResourceContainers | where type == 'microsoft.resources/subscriptions' | extend mgChain = properties.managementGroupAncestorsChain | where mgChain has '${each.value}' | project subscriptionId" -o json | jq '{subscriptions: [.data[].subscriptionId] | tostring}'
+    az graph query -q "ResourceContainers | where type == 'microsoft.resources/subscriptions' | extend mgChain = properties.managementGroupAncestorsChain | where mgChain has '${each.value}' | project subscriptionId" -o json | jq -c '{subscriptions: ([.data[].subscriptionId] | @json)}'
   EOT
   ]
 }
@@ -71,7 +71,7 @@ locals {
   include_sub_to_mg = var.mode == "include" ? merge(
     [
       for mg, res in data.external.included_mg_subs : {
-        for sub_id in jsondecode(res.result.subscriptions) :
+        for sub_id in try(jsondecode(res.result.subscriptions), []) :
         sub_id => mg
       }
     ]...
