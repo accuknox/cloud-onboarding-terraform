@@ -1,4 +1,4 @@
-# Azure Lighthouse: Auto-Onboard Subscriptions (Terraform)
+# AccuKnox Azure Onboarding
 
 ## Overview
 
