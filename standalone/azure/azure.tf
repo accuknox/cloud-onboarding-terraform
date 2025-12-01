@@ -144,9 +144,9 @@ output "directory_id" {
 resource "local_file" "client_secret_and_app_sub_dir_file" {
   filename = "client_secret_and_app_sub_dir.txt"
   content = <<-EOT
-Client ID: ${azuread_application.accuknox.client_id}
-Client Secret: ${azuread_service_principal_password.client_secret.value}
+Application ID: ${azuread_application.accuknox.client_id}
+Application Secret: ${azuread_service_principal_password.client_secret.value}
 Subscription ID: ${split("/", trim(data.azurerm_subscription.current.id, "/"))[1]}
-Directory ID: ${data.azurerm_client_config.current.tenant_id}
+Directory/ Tenant ID: ${data.azurerm_client_config.current.tenant_id}
 EOT
 }
