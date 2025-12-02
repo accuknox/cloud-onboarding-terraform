@@ -362,5 +362,30 @@ See `terraform.tfvars.example` for all available variables and their description
 
 ---
 
+
+### List Management Groups
+
+1. All MG
+   ```code
+      az graph query -q "
+      ResourceContainers
+      | where type == 'microsoft.resources/subscriptions'
+      | extend mgChain = properties.managementGroupAncestorsChain
+      | project subscriptionId, mgChain
+      "
+   ```
+
+2. Tenant-Id Filter
+   ```code
+      az graph query -q "
+      ResourceContainers
+      | where type == 'microsoft.resources/subscriptions'
+      | where tenantId == '<<--Tenant-Id-->>'
+      | extend mgChain = properties.managementGroupAncestorsChain
+      | project subscriptionId, mgChain
+      "
+   ```
+
+---
 ## Support & Troubleshooting
 Contact - support@accuknox.com
