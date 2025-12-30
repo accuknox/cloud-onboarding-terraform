@@ -386,6 +386,15 @@ See `terraform.tfvars.example` for all available variables and their description
       "
    ```
 
+3. List All Subscription with Name
+   ```code
+      az graph query -q "
+      ResourceContainers 
+      | where type == 'microsoft.resources/subscriptions' 
+      | project subscriptionId, name
+      "
+   ```
+
 ---
 ## Support & Troubleshooting
 Contact - support@accuknox.com
