@@ -98,7 +98,7 @@ variable "authorizations" {
   }))
   default = [
     {
-      principal_id           = "346a4e9f-6607-4fa2-bedb-5eff186b44c3" # AccuKnox App Register
+      principal_id           = "603f62f6-283e-4307-9735-d4a801daf8aa" # AccuKnox App Register
       principal_display_name = "AccuKnox CSPM Reader"
       role_definition_id     = "acdd72a7-3385-48ef-bd42-f606fba81ae7" # Reader
     },
@@ -115,7 +115,7 @@ variable "authorizations" {
 variable "mode" {
   description = "Onboarding mode: 'include' or 'exclude'"
   type        = string
-  default     = "include"
+  default     = "exclude"
 
   validation {
     condition     = contains(["include", "exclude"], var.mode)
@@ -376,13 +376,15 @@ resource "azurerm_lighthouse_assignment" "exclude_mode_exceptions" {
 ########################################################
 
 # Simple policy that creates lighthouse assignments for new subscriptions
+# Create policy definition at each included management group to ensure scope compatibility
 resource "azurerm_policy_definition" "auto_lighthouse_assignment" {
-  name                = var.policy_definition_name
-  management_group_id = data.azurerm_management_group.target.id
-  policy_type         = "Custom"
-  mode                = "All"
-  display_name        = "Auto-assign AccuKnox Lighthouse to new subscriptions"
-  description         = "Automatically creates lighthouse assignments for new subscriptions using the shared definition"
+  for_each           = var.mode == "include" ? toset(local.filtered_included_management_group_ids) : toset([var.management_group_id])
+  name               = var.policy_definition_name
+  management_group_id = "/providers/Microsoft.Management/managementGroups/${each.value}"
+  policy_type        = "Custom"
+  mode               = "All"
+  display_name       = "Auto-assign AccuKnox Lighthouse to new subscriptions"
+  description        = "Automatically creates lighthouse assignments for new subscriptions using the shared definition"
 
   parameters = jsonencode({
     lighthouseDefinitionId = {
@@ -462,7 +464,7 @@ resource "azurerm_management_group_policy_assignment" "auto_lighthouse_include" 
   name                 = "${var.policy_assignment_name}-auto-${substr(local.filtered_included_management_group_ids[count.index], 0, 8)}"
   display_name         = "Auto Lighthouse Assignment - ${local.filtered_included_management_group_ids[count.index]}"
   management_group_id  = "/providers/Microsoft.Management/managementGroups/${local.filtered_included_management_group_ids[count.index]}"
-  policy_definition_id = azurerm_policy_definition.auto_lighthouse_assignment.id
+  policy_definition_id = azurerm_policy_definition.auto_lighthouse_assignment[local.filtered_included_management_group_ids[count.index]].id
   location             = var.policy_assignment_location
   enforce              = true
   not_scopes           = [for sub in var.excluded_subscription_ids : "/subscriptions/${sub}"]
@@ -510,7 +512,7 @@ resource "azurerm_management_group_policy_assignment" "auto_lighthouse_exclude" 
   name                 = "${var.policy_assignment_name}-auto-exclude"
   display_name         = "Auto Lighthouse Assignment - Exclude Mode"
   management_group_id  = data.azurerm_management_group.target.id
-  policy_definition_id = azurerm_policy_definition.auto_lighthouse_assignment.id
+  policy_definition_id = azurerm_policy_definition.auto_lighthouse_assignment[var.management_group_id].id
   location             = var.policy_assignment_location
   enforce              = true
   not_scopes = concat(
