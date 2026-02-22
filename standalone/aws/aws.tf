@@ -32,7 +32,9 @@ resource "aws_iam_user_policy" "ai_ml_permissions" {
           "bedrock:InvokeModel",
           "bedrock:ListImportedModels",
           "bedrock:ListModelInvocationJobs",
-          "sagemaker:InvokeEndpoint"
+          "sagemaker:InvokeEndpoint",
+          "aws-marketplace:Subscribe",
+          "aws-marketplace:ViewSubscriptions"
         ]
         Resource = "*"
       }
