@@ -83,7 +83,7 @@ variable "offer_name" {
 variable "offer_description" {
   description = "Lighthouse offer description"
   type        = string
-  default     = "Delegated read-only access via Lighthouse"
+  default     = "Delegated read-only access / policy contributor access if enabled"
 }
 
 
@@ -98,27 +98,14 @@ variable "authorizations" {
   }))
   default = [
     {
-      principal_id           = "603f62f6-283e-4307-9735-d4a801daf8aa" # AccuKnox App Register
+      principal_id           = "47e2ce34-c78d-4aaf-8f5f-300ec63c907f" # AccuKnox App Register
       principal_display_name = "AccuKnox CSPM Reader"
       role_definition_id     = "acdd72a7-3385-48ef-bd42-f606fba81ae7" # Reader
     },
     {
-      principal_id           = "cc2d4923-7605-4505-82e2-5235216d03fc" 
+      principal_id           = "cc2d4923-7605-4505-82e2-5235216d03fc"
       principal_display_name = "Ayush Aggarwal"
-      role_definition_id     = "acdd72a7-3385-48ef-bd42-f606fba81ae7" # Reader
-    },
-    {
-      principal_id           = "<INSERT_YOUR_SAAS_SERVICE_PRINCIPAL_OBJECT_ID_HERE>" 
-      principal_display_name = "AccuKnox Policy Contributor"
-      role_definition_id     = "36243c78-bf99-498c-9df9-86d9f8d28608" # Resource Policy Contributor
-    },
-    {
-      principal_id           = "<INSERT_YOUR_SAAS_SERVICE_PRINCIPAL_OBJECT_ID_HERE>" 
-      principal_display_name = "AccuKnox User Access Administrator"
-      role_definition_id     = "18d7d88d-d35e-4fb5-a5c3-7773c20a72d9" # User Access Administrator
-      delegated_role_definition_ids = [
-        "b24988ac-6180-42a0-ab88-20f7382dd24c" # Contributor (Required for assigning Managed Identities in DeployIfNotExists policies)
-      ]
+      role_definition_id     = "acdd72a7-3385-48ef-bd42-f606fba81ae7"
     }
   ]
 }
@@ -203,6 +190,11 @@ variable "deployment_location" {
   default     = "eastus"
 }
 
+variable "policy_management" {
+  description = "Enable Azure Policy management permissions"
+  type        = bool
+  default     = false
+}
 
 
 ########################################################
@@ -224,6 +216,32 @@ data "azurerm_management_group" "included" {
 
 locals {
   mg_scope_id = data.azurerm_management_group.target.id
+
+  policy_management_authorizations = [
+    {
+      principal_id           = "ded9fee3-ae1a-40e4-90db-20898b7d83a8"
+      principal_display_name = "AccuKnox Policy Contributor"
+      role_definition_id     = "36243c78-bf99-498c-9df9-86d9f8d28608"
+    },
+    {
+      principal_id           = "ded9fee3-ae1a-40e4-90db-20898b7d83a8"
+      principal_display_name = "AccuKnox User Access Administrator"
+      role_definition_id     = "18d7d88d-d35e-4fb5-a5c3-7773c20a72d9"
+
+      delegated_role_definition_ids = [
+        "b24988ac-6180-42a0-ab88-20f7382dd24c"
+      ]
+    }
+  ]
+
+  effective_authorizations = concat(
+    var.authorizations,
+    [
+      for a in local.policy_management_authorizations : a
+      if var.policy_management
+    ]
+  )
+
 
   # Transform authorizations to the format expected by azurerm_lighthouse_definition
   managed_by_authorizations = [
@@ -250,7 +268,7 @@ locals {
 # Discover subscriptions per included management group using Resource Graph
 data "external" "included_mg_subs" {
   for_each = toset(local.filtered_included_management_group_ids)
-  program  = ["bash", "-c", <<-EOT
+  program = ["bash", "-c", <<-EOT
     az graph query -q "ResourceContainers | where type == 'microsoft.resources/subscriptions' | extend mgChain = properties.managementGroupAncestorsChain | where mgChain has '${each.value}' | project subscriptionId" -o json | jq -c '{subscriptions: ([.data[].subscriptionId] | @json)}'
   EOT
   ]
@@ -342,12 +360,12 @@ resource "azurerm_lighthouse_definition" "shared_lighthouse_definition" {
   scope              = "/subscriptions/${local.customer_subscription_id}"
 
   dynamic "authorization" {
-    for_each = var.authorizations
+    for_each = local.effective_authorizations
     content {
-      principal_id                     = authorization.value.principal_id
-      principal_display_name           = authorization.value.principal_display_name
-      role_definition_id               = authorization.value.role_definition_id
-      delegated_role_definition_ids    = try(authorization.value.delegated_role_definition_ids, null)
+      principal_id                  = authorization.value.principal_id
+      principal_display_name        = authorization.value.principal_display_name
+      role_definition_id            = authorization.value.role_definition_id
+      delegated_role_definition_ids = try(authorization.value.delegated_role_definition_ids, null)
     }
   }
 }
@@ -391,13 +409,13 @@ resource "azurerm_lighthouse_assignment" "exclude_mode_exceptions" {
 # Simple policy that creates lighthouse assignments for new subscriptions
 # Create policy definition at each included management group to ensure scope compatibility
 resource "azurerm_policy_definition" "auto_lighthouse_assignment" {
-  for_each           = var.mode == "include" ? toset(local.filtered_included_management_group_ids) : toset([var.management_group_id])
-  name               = var.policy_definition_name
+  for_each            = var.mode == "include" ? toset(local.filtered_included_management_group_ids) : toset([var.management_group_id])
+  name                = var.policy_definition_name
   management_group_id = "/providers/Microsoft.Management/managementGroups/${each.value}"
-  policy_type        = "Custom"
-  mode               = "All"
-  display_name       = "Auto-assign AccuKnox Lighthouse to new subscriptions"
-  description        = "Automatically creates lighthouse assignments for new subscriptions using the shared definition"
+  policy_type         = "Custom"
+  mode                = "All"
+  display_name        = "Auto-assign AccuKnox Lighthouse to new subscriptions"
+  description         = "Automatically creates lighthouse assignments for new subscriptions using the shared definition"
 
   parameters = jsonencode({
     lighthouseDefinitionId = {
@@ -408,7 +426,7 @@ resource "azurerm_policy_definition" "auto_lighthouse_assignment" {
 
   policy_rule = jsonencode({
     if = {
-      field = "type"
+      field  = "type"
       equals = "Microsoft.Resources/subscriptions"
     }
     then = {
@@ -422,11 +440,11 @@ resource "azurerm_policy_definition" "auto_lighthouse_assignment" {
         existenceCondition = {
           allOf = [
             {
-              field = "type"
+              field  = "type"
               equals = "Microsoft.ManagedServices/registrationAssignments"
             },
             {
-              field = "Microsoft.ManagedServices/registrationAssignments/registrationDefinitionId"
+              field  = "Microsoft.ManagedServices/registrationAssignments/registrationDefinitionId"
               equals = "[parameters('lighthouseDefinitionId')]"
             }
           ]
