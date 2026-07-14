@@ -25,10 +25,6 @@ terraform {
       source  = "hashicorp/azuread"
       version = ">= 2.47.0"
     }
-    powerplatform = {
-      source  = "microsoft/power-platform"
-      version = ">= 3.7, < 5.0"
-    }
   }
 }
 
@@ -43,13 +39,6 @@ provider "azurerm" {
 provider "azapi" {}
 
 provider "azuread" {}
-
-# Power Platform: use_cli = true reuses your `az login` session.
-provider "powerplatform" {
-  use_cli = true
-}
-
-
 
 ########################################################
 # Variables
@@ -155,7 +144,7 @@ variable "excluded_subscription_ids" {
 variable "included_management_group_ids" {
   description = "Management groups to include (include mode only)"
   type        = list(string)
-  default     = ["tfc_test","azureorgtesting"]
+  default     = [""]
 }
 
 variable "include_extra_subscription_ids" {
@@ -221,7 +210,7 @@ variable "enable_graph_permissions" {
 }
 
 variable "accuknox_app_client_id" {
-  description = "Client (application) ID of the AccuKnox enterprise app / service principal in the customer tenant, used for Graph permission grants."
+  description = "Client (application) ID of the AccuKnox enterprise app / service principal in the customer tenant, used for Graph permission grants and the Power Platform application user."
   type        = string
   default     = "384d0c6d-8e35-489a-8833-346c5bbf2dbc"
 }
@@ -249,18 +238,33 @@ variable "enable_powerplatform_registration" {
   default     = true
 }
 
+variable "powerplatform_environment_selection" {
+  description = "'all' = every Dataverse environment the operator can access (from the API); 'specific' = only those in only_environment_display_names."
+  type        = string
+  default     = "all"
+  validation {
+    condition     = contains(["all", "specific"], var.powerplatform_environment_selection)
+    error_message = "powerplatform_environment_selection must be 'all' or 'specific'."
+  }
+}
+
+variable "only_environment_display_names" {
+  description = "Environment display names to onboard when powerplatform_environment_selection = 'specific'. Ignored when selection = 'all'."
+  type        = list(string)
+  default     = []
+}
+
 variable "dataverse_security_role_name" {
   description = "Dataverse security role assigned to the AccuKnox application user."
   type        = string
   default     = "Service Reader"
 }
 
-variable "only_environment_display_names" {
-  description = "Restrict Power Platform registration to these environment display names. Empty = ALL Dataverse environments."
-  type        = list(string)
-  default     = []
+variable "powerplatform_api_version" {
+  description = "BAP API version used for environment discovery."
+  type        = string
+  default     = "2021-04-01"
 }
-
 
 ########################################################
 # Custom ML Scanner Role Variables
@@ -333,8 +337,8 @@ locals {
 # Discover subscriptions per included management group using Resource Graph
 data "external" "included_mg_subs" {
   for_each = toset(local.filtered_included_management_group_ids)
-  program  = ["bash", "-c", <<-EOT
-    az graph query -q "ResourceContainers | where type == 'microsoft.resources/subscriptions' | extend mgChain = properties.managementGroupAncestorsChain | where mgChain has '${each.value}' | project subscriptionId" -o json | jq -c '{subscriptions: ([.data[].subscriptionId] | @json)}'
+  program = ["bash", "-c", <<-EOT
+    az graph query -q "ResourceContainers | where type == 'microsoft.resources/subscriptions' | extend mgChain = properties.managementGroupAncestorsChain | where mgChain has '${each.value}' | project subscriptionId" --query "{ subscriptions: to_string(data[].subscriptionId) }" -o json
   EOT
   ]
 }
@@ -496,8 +500,7 @@ data "azuread_service_principal" "accuknox" {
 }
 
 resource "azuread_app_role_assignment" "accuknox_graph" {
-  for_each = var.enable_graph_permissions ? toset(var.graph_app_role_ids) : []
-
+  for_each            = var.enable_graph_permissions ? toset(var.graph_app_role_ids) : []
   app_role_id         = each.value
   principal_object_id = data.azuread_service_principal.accuknox[0].object_id
   resource_object_id  = data.azuread_service_principal.msgraph[0].object_id
@@ -519,7 +522,7 @@ locals {
   all_target_subscription_ids = var.mode == "include" ? distinct(concat(
     local.include_mode_subscription_ids,
     local.filtered_include_extra_subscription_ids
-  )) : distinct(concat(
+    )) : distinct(concat(
     local.exclude_mode_subscription_ids,
     local.filtered_include_exception_subscription_ids
   ))
@@ -550,7 +553,7 @@ resource "azurerm_role_definition" "accuknox_ml_scanner" {
 
   permissions {
     actions = var.ml_scanner_custom_role_actions
-    # All four are management-plane actions; no data_actions / not_actions required.
+    # All are management-plane actions; no data_actions / not_actions required.
     not_actions = []
   }
 
@@ -581,128 +584,157 @@ resource "azurerm_role_assignment" "accuknox_ml_scanner" {
 # Power Platform — register AccuKnox app as a Service Reader
 ########################################################
 
-data "powerplatform_environments" "all" {
+# 1) Discover accessible Dataverse environments via the BAP API.
+data "external" "powerplatform_environments" {
   count = var.enable_powerplatform_registration ? 1 : 0
+  program = ["bash", "-c", <<-EOT
+    az rest --method get \
+      --url "https://api.bap.microsoft.com/providers/Microsoft.BusinessAppPlatform/environments?api-version=${var.powerplatform_api_version}&%24expand=properties.linkedEnvironmentMetadata" \
+      --resource "https://api.bap.microsoft.com/" --only-show-errors \
+      --query "{ envs: to_string(value[?properties.linkedEnvironmentMetadata.instanceUrl].{ id: name, name: properties.displayName, url: properties.linkedEnvironmentMetadata.instanceUrl }) }" \
+      -o json
+  EOT
+  ]
 }
 
 locals {
-  dataverse_envs = var.enable_powerplatform_registration ? {
-    for env in data.powerplatform_environments.all[0].environments :
-    env.display_name => env
-    if env.dataverse != null && (
-      length(var.only_environment_display_names) == 0 ||
-      contains(var.only_environment_display_names, env.display_name)
-    )
-  } : {}
-}
+  pp_all_envs = var.enable_powerplatform_registration ? jsondecode(
+    data.external.powerplatform_environments[0].result.envs
+  ) : []
 
-
-data "powerplatform_data_records" "root_business_unit" {
-  for_each          = local.dataverse_envs
-  environment_id    = each.value.id
-  entity_collection = "businessunits"
-  filter            = "parentbusinessunitid eq null"
-  select            = ["name"]
-}
-
-# Security roles per environment (to resolve the role name -> role_id).
-data "powerplatform_security_roles" "roles" {
-  for_each         = local.dataverse_envs
-  environment_id   = each.value.id
-  business_unit_id = data.powerplatform_data_records.root_business_unit[each.key].rows[0].businessunitid
-}
-
-locals {
-  role_id_by_env = {
-    for name, _ in local.dataverse_envs :
-    name => one([
-      for role in data.powerplatform_security_roles.roles[name].security_roles :
-      role.role_id if role.name == var.dataverse_security_role_name
-    ])
-  }
-}
-
-# Application user (systemuser keyed by the AccuKnox app CLIENT ID) with the
-# Service Reader role only, in each environment.
-resource "powerplatform_data_record" "app_user" {
-  for_each = local.dataverse_envs
-
-  environment_id     = each.value.id
-  table_logical_name = "systemuser"
-
-  columns = {
-    applicationid = var.accuknox_app_client_id
-
-    businessunitid = {
-      table_logical_name = "businessunit"
-      data_record_id     = data.powerplatform_data_records.root_business_unit[each.key].rows[0].businessunitid
+  # Apply the enable/all/specific selection; normalise the Dataverse URL
+  dataverse_envs = {
+    for env in local.pp_all_envs :
+    env.id => {
+      id   = env.id
+      name = env.name
+      url  = trimsuffix(env.url, "/")
     }
-
-    systemuserroles_association = toset([
-      {
-        table_logical_name = "role"
-        data_record_id     = local.role_id_by_env[each.key]
-      }
-    ])
-  }
-
-  lifecycle {
-    precondition {
-      condition     = local.role_id_by_env[each.key] != null
-      error_message = "Security role '${var.dataverse_security_role_name}' not found in environment '${each.key}'."
-    }
+    if var.powerplatform_environment_selection == "all" ||
+    contains(var.only_environment_display_names, env.name)
   }
 }
 
-# Disable each application user BEFORE Terraform deletes it. 
-resource "terraform_data" "disable_app_user_on_destroy" {
+# 2/3) Create (and, on destroy, remove) the AccuKnox application user per env.
+resource "terraform_data" "pp_app_user" {
   for_each = local.dataverse_envs
 
   input = {
-    url          = trimsuffix(each.value.dataverse.url, "/")
-    systemuserid = powerplatform_data_record.app_user[each.key].id
+    url       = each.value.url
+    env_id    = each.value.id
+    env_name  = each.value.name
+    app_id    = var.accuknox_app_client_id
+    role_name = var.dataverse_security_role_name
   }
 
-  depends_on = [powerplatform_data_record.app_user]
+  # Re-run create if any of these change.
+  triggers_replace = {
+    url       = each.value.url
+    app_id    = var.accuknox_app_client_id
+    role_name = var.dataverse_security_role_name
+  }
 
+  # ---- CREATE ----
   provisioner "local-exec" {
-    when    = destroy
-    command = <<-EOT
+    when        = create
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
       set -uo pipefail
-      base="${self.input.url}/api/data/v9.2/systemusers(${self.input.systemuserid})"
-      # 1) Disable the application user (Dataverse refuses to delete enabled users).
-      az rest --method patch \
-        --url "$base" \
-        --resource "${self.input.url}" \
-        --headers "Content-Type=application/json" \
-        --body '{"isdisabled": true}' \
-        --only-show-errors || true
-      sleep 5
-      # 2) Delete the systemuser so the application user is removed from the env.
-      az rest --method delete \
-        --url "$base" \
-        --resource "${self.input.url}" \
-        --only-show-errors || true
+      base="${self.input.url}/api/data/v9.2"
+      res="${self.input.url}"
+      app="${self.input.app_id}"
+      role="${self.input.role_name}"
+      env="${self.input.env_name}"
+
+      bu=$(az rest --method get \
+        --url "$base/businessunits?%24select=businessunitid&%24filter=parentbusinessunitid%20eq%20null" \
+        --resource "$res" --only-show-errors --query "value[0].businessunitid" -o tsv 2>/dev/null)
+      if [ -z "$bu" ]; then echo "SKIP $env: no Dataverse access"; exit 0; fi
+
+      roleid=$(az rest --method get \
+        --url "$base/roles?%24select=roleid&%24filter=name%20eq%20'$role'%20and%20_businessunitid_value%20eq%20$bu" \
+        --resource "$res" --only-show-errors --query "value[0].roleid" -o tsv)
+      if [ -z "$roleid" ]; then echo "ERROR $env: role '$role' not found" >&2; exit 1; fi
+
+      uid=$(az rest --method get \
+        --url "$base/systemusers?%24select=systemuserid&%24filter=applicationid%20eq%20$app" \
+        --resource "$res" --only-show-errors --query "value[0].systemuserid" -o tsv)
+
+      # Create if missing.
+      if [ -z "$uid" ]; then
+        uid=$(az rest --method post --url "$base/systemusers" --resource "$res" \
+          --headers "Content-Type=application/json" "Prefer=return=representation" \
+          --body "{\"applicationid\":\"$app\",\"businessunitid@odata.bind\":\"/businessunits($bu)\"}" \
+          --only-show-errors --query "systemuserid" -o tsv)
+        if [ -z "$uid" ]; then
+          echo "ERROR $env: could not create app user (operator needs System Administrator in this env)" >&2
+          exit 1
+        fi
+      fi
+
+      az rest --method patch --url "$base/systemusers($uid)" --resource "$res" \
+        --headers "Content-Type=application/json" --body '{"isdisabled":false}' \
+        --only-show-errors \
+        || echo "WARN $env: could not enable app user $uid (missing prvWriteUser?)" >&2
+
+      err=$(mktemp)
+      if az rest --method post \
+        --url "$base/systemusers($uid)/systemuserroles_association/%24ref" \
+        --resource "$res" --headers "Content-Type=application/json" \
+        --body "{\"@odata.id\":\"$base/roles($roleid)\"}" \
+        --only-show-errors 2>"$err"; then
+        echo "OK $env: app user $uid ($role assigned)"
+      elif grep -qiE 'duplicate|already' "$err"; then
+        echo "OK $env: app user $uid ($role already assigned)"
+      else
+        echo "WARN $env: app user $uid present but role NOT assigned:" >&2
+        cat "$err" >&2
+      fi
+      rm -f "$err"
+    EOT
+  }
+
+  # ---- DESTROY ---- (look up fresh, disable, then delete)
+  provisioner "local-exec" {
+    when        = destroy
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      set -uo pipefail
+      base="${self.input.url}/api/data/v9.2"
+      res="${self.input.url}"
+      app="${self.input.app_id}"
+      env="${self.input.env_name}"
+
+      uid=$(az rest --method get \
+        --url "$base/systemusers?%24select=systemuserid&%24filter=applicationid%20eq%20$app" \
+        --resource "$res" --only-show-errors --query "value[0].systemuserid" -o tsv 2>/dev/null)
+      if [ -z "$uid" ]; then echo "SKIP $env: nothing to remove"; exit 0; fi
+
+      # NOTE: Dataverse does NOT allow hard-deleting a systemuser / application
+      if az rest --method patch --url "$base/systemusers($uid)" --resource "$res" \
+        --headers "Content-Type=application/json" --body '{"isdisabled":true}' \
+        --only-show-errors; then
+        echo "DISABLED $env: app user $uid (access revoked; record retained by design)"
+      else
+        echo "WARN $env: could NOT disable app user $uid — operator lacks prvWriteUser (System Administrator) here; disable it manually in the Power Platform admin center" >&2
+      fi
     EOT
   }
 }
 
-
-
 ########################################################
 # Policy for Automatic Assignment to New Subscriptions
 ########################################################
-
 # Simple policy that creates lighthouse assignments for new subscriptions
 # Create policy definition at each included management group to ensure scope compatibility
 resource "azurerm_policy_definition" "auto_lighthouse_assignment" {
-  for_each           = var.mode == "include" ? toset(local.filtered_included_management_group_ids) : toset([var.management_group_id])
-  name               = var.policy_definition_name
+  for_each            = var.mode == "include" ? toset(local.filtered_included_management_group_ids) : toset([var.management_group_id])
+  name                = var.policy_definition_name
   management_group_id = "/providers/Microsoft.Management/managementGroups/${each.value}"
-  policy_type        = "Custom"
-  mode               = "All"
-  display_name       = "Auto-assign AccuKnox Lighthouse to new subscriptions"
-  description        = "Automatically creates lighthouse assignments for new subscriptions using the shared definition"
+  policy_type         = "Custom"
+  mode                = "All"
+  display_name        = "Auto-assign AccuKnox Lighthouse to new subscriptions"
+  description         = "Automatically creates lighthouse assignments for new subscriptions using the shared definition"
 
   parameters = jsonencode({
     lighthouseDefinitionId = {
@@ -713,7 +745,7 @@ resource "azurerm_policy_definition" "auto_lighthouse_assignment" {
 
   policy_rule = jsonencode({
     if = {
-      field = "type"
+      field  = "type"
       equals = "Microsoft.Resources/subscriptions"
     }
     then = {
@@ -727,11 +759,11 @@ resource "azurerm_policy_definition" "auto_lighthouse_assignment" {
         existenceCondition = {
           allOf = [
             {
-              field = "type"
+              field  = "type"
               equals = "Microsoft.ManagedServices/registrationAssignments"
             },
             {
-              field = "Microsoft.ManagedServices/registrationAssignments/registrationDefinitionId"
+              field  = "Microsoft.ManagedServices/registrationAssignments/registrationDefinitionId"
               equals = "[parameters('lighthouseDefinitionId')]"
             }
           ]
@@ -775,7 +807,6 @@ resource "azurerm_policy_definition" "auto_lighthouse_assignment" {
 ########################################################
 # Policy Assignments for Automatic Onboarding
 ########################################################
-
 # Policy assignment for include mode
 resource "azurerm_management_group_policy_assignment" "auto_lighthouse_include" {
   count                = length(local.filtered_included_management_group_ids)
@@ -785,7 +816,8 @@ resource "azurerm_management_group_policy_assignment" "auto_lighthouse_include" 
   policy_definition_id = azurerm_policy_definition.auto_lighthouse_assignment[local.filtered_included_management_group_ids[count.index]].id
   location             = var.policy_assignment_location
   enforce              = true
-  not_scopes           = [for sub in var.excluded_subscription_ids : "/subscriptions/${sub}"]
+
+  not_scopes = [for sub in var.excluded_subscription_ids : "/subscriptions/${sub}"]
 
   identity { type = "SystemAssigned" }
 
@@ -807,12 +839,11 @@ resource "azurerm_role_assignment" "auto_policy_identity_owner_include" {
 ########################################################
 # Automatic Remediation for Include Mode
 ########################################################
-
 # Create remediation task for each management group
 resource "azurerm_management_group_policy_remediation" "auto_lighthouse_include" {
-  count                = length(local.filtered_included_management_group_ids)
-  name                 =  lower("remediate-lighthouse-${replace(local.filtered_included_management_group_ids[count.index], "/[^a-zA-Z0-9-]/", "-")}")
-  management_group_id  = "/providers/Microsoft.Management/managementGroups/${local.filtered_included_management_group_ids[count.index]}"
+  count               = length(local.filtered_included_management_group_ids)
+  name                = lower("remediate-lighthouse-${replace(local.filtered_included_management_group_ids[count.index], "/[^a-zA-Z0-9-]/", "-")}")
+  management_group_id = "/providers/Microsoft.Management/managementGroups/${local.filtered_included_management_group_ids[count.index]}"
   policy_assignment_id = azurerm_management_group_policy_assignment.auto_lighthouse_include[count.index].id
   location_filters     = []
   failure_percentage   = 1.0
@@ -833,6 +864,7 @@ resource "azurerm_management_group_policy_assignment" "auto_lighthouse_exclude" 
   policy_definition_id = azurerm_policy_definition.auto_lighthouse_assignment[var.management_group_id].id
   location             = var.policy_assignment_location
   enforce              = true
+
   not_scopes = concat(
     [for mg in var.excluded_management_groups : "/providers/Microsoft.Management/managementGroups/${mg}"],
     [for sub in var.excluded_subscription_ids : "/subscriptions/${sub}"]
@@ -858,7 +890,6 @@ resource "azurerm_role_assignment" "auto_policy_identity_owner_exclude" {
 ########################################################
 # Automatic Remediation for Exclude Mode
 ########################################################
-
 resource "azurerm_management_group_policy_remediation" "auto_lighthouse_exclude" {
   count                = var.mode == "exclude" ? 1 : 0
   name                 = "remediate-lighthouse-exclude"
@@ -874,25 +905,10 @@ resource "azurerm_management_group_policy_remediation" "auto_lighthouse_exclude"
   ]
 }
 
-
-
 ########################################################
 # Power Platform Outputs
 ########################################################
-
-output "powerplatform_registered_environments" {
-  description = "Dataverse environments where the AccuKnox app user was successfully created (name => environment id)."
-  value = {
-    for name, env in local.dataverse_envs :
-    name => env.id
-    if can(powerplatform_data_record.app_user[name].id)
-  }
-}
-
-output "powerplatform_failed_environments" {
-  description = "Eligible Dataverse environments whose app-user registration did NOT succeed."
-  value = [
-    for name, _ in local.dataverse_envs :
-    name if !can(powerplatform_data_record.app_user[name].id)
-  ]
+output "powerplatform_selected_environments" {
+  description = "Environments selected for AccuKnox app-user registration (display name => Dataverse URL)."
+  value       = { for id, env in local.dataverse_envs : env.name => env.url }
 }
